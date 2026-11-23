@@ -19,7 +19,7 @@
 #include <zstd.h>
 
 #define ROOT_LEN (sizeof(NUP_ROMFS_ROOT) - 1)
-#define KEEP_BYTES (128ull << 20)   /* (the console's memory is shared by everything: 512 MiB was too much) */
+#define KEEP_BYTES (128ull << 20)   /* normal closed-file cache; smaller when the PS5 is low on memory */
 
 typedef struct { uint32_t name_off, name_len, first, count; } Dir;
 typedef struct { uint32_t name_off, name_len; uint64_t size, offset, stored; uint8_t codec; } File;
@@ -185,19 +185,48 @@ int64_t nup_romfs_find(const char *path, int *is_dir, uint64_t *size) {
 }
 
 /* ---- open files: a plain one reads from the package; a packed one from its unpacked bytes ---- */
-typedef struct Unpacked { struct Unpacked *next; uint64_t file; uint8_t *data; int users; uint64_t last_use; } Unpacked;
+/* File data is immutable once the loader signals it is ready. Its users count pins it against LRU eviction.
+   The global lock protects the LRU, the handle table and loading states, but never disk I/O or Zstd: a new area
+   can ask for several assets at once, and a long decompression must not hold every other read/open/close hostage.
+   Two concurrent decompressions bound the temporary packed + unpacked buffers on a memory-constrained PS5. */
+typedef struct Unpacked {
+    struct Unpacked *next;
+    uint64_t file;
+    uint8_t *data;
+    int users;
+    int loading;
+    uint64_t last_use;
+} Unpacked;
 static Unpacked *unpacked;
 static uint64_t unpacked_bytes, use_clock;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t unpack_changed = PTHREAD_COND_INITIALIZER;
+static unsigned active_unpacks;
+#define MAX_ACTIVE_UNPACKS 2
+
 typedef struct { uint64_t file; Unpacked *u; } Handle;
 static Handle *handles;
 static size_t nhandles;
 
+static uint64_t keep_budget(void) {
+#ifdef __PROSPERO__
+    /* The title shares direct memory between game pages, RADV and its file cache. Do not keep old unpacked
+       assets when the GPU or a new scene needs the room. This query is cached by win32_ps5.c. */
+    extern uint64_t hos_ps5_direct_room(void);
+    const uint64_t room = hos_ps5_direct_room();
+    if (room && room < (512ull << 20)) return 0;
+    if (room && room < (1024ull << 20)) return 32ull << 20;
+#endif
+    return KEEP_BYTES;
+}
+
 static void trim(void) {   /* lock held: the least recently used unpacked files nobody holds, past KEEP_BYTES */
-    while (unpacked_bytes > KEEP_BYTES) {
+    const uint64_t budget = keep_budget();
+    while (unpacked_bytes > budget) {
         Unpacked **victim = NULL;
         for (Unpacked **p = &unpacked; *p; p = &(*p)->next)
-            if (!(*p)->users && (!victim || (*p)->last_use < (*victim)->last_use)) victim = p;
+            if (!(*p)->users && !(*p)->loading &&
+                (!victim || (*p)->last_use < (*victim)->last_use)) victim = p;
         if (!victim) return;
         Unpacked *u = *victim;
         *victim = u->next;
@@ -206,27 +235,62 @@ static void trim(void) {   /* lock held: the least recently used unpacked files 
     }
 }
 
-static Unpacked *unpack(uint64_t f) {   /* lock held */
-    for (Unpacked *u = unpacked; u; u = u->next)
-        if (u->file == f) { u->users++, u->last_use = ++use_clock; return u; }
-    const File *r = &files[f];
-    uint8_t *packed = malloc(r->stored ? r->stored : 1), *data = malloc(r->size ? r->size : 1);
-    if (!packed || !data || !read_at(packed, r->stored, r->offset)) { free(packed), free(data); return NULL; }
-    const size_t got = ZSTD_decompress(data, r->size, packed, r->stored);
-    free(packed);
-    if (ZSTD_isError(got) || got != r->size) {
-        fprintf(stderr, "[ps5] romfs: unpacking file %llu failed (%s)\n", (unsigned long long)f,
-                ZSTD_isError(got) ? ZSTD_getErrorName(got) : "short");
-        free(data);
-        return NULL;
+static Unpacked *unpack(uint64_t f) {   /* called with lock held; always returns with lock held */
+    for (;;) {
+        Unpacked *u = unpacked;
+        while (u && u->file != f) u = u->next;
+        if (u) {
+            if (u->loading) {
+                /* Re-find after waking: neither the pointer nor its position is stable across a wait. */
+                pthread_cond_wait(&unpack_changed, &lock);
+                continue;
+            }
+            u->users++, u->last_use = ++use_clock;
+            return u;
+        }
+        if (active_unpacks == MAX_ACTIVE_UNPACKS) {
+            pthread_cond_wait(&unpack_changed, &lock);
+            continue;
+        }
+        u = calloc(1, sizeof *u);
+        if (!u) return NULL;
+        u->file = f;
+        u->users = 1;       /* pin while loading, even when the cache is over its limit */
+        u->loading = 1;
+        u->next = unpacked, unpacked = u;
+        ++active_unpacks;
+
+        const File *r = &files[f];
+        pthread_mutex_unlock(&lock);
+        uint8_t *packed = malloc(r->stored ? r->stored : 1);
+        uint8_t *data = malloc(r->size ? r->size : 1);
+        int ok = packed && data && read_at(packed, r->stored, r->offset);
+        if (ok) {
+            const size_t got = ZSTD_decompress(data, r->size, packed, r->stored);
+            ok = !ZSTD_isError(got) && got == r->size;
+        }
+        free(packed);
+        pthread_mutex_lock(&lock);
+        --active_unpacks;
+        u->loading = 0;
+        u->last_use = ++use_clock;
+        if (ok) {
+            u->data = data;
+            unpacked_bytes += r->size;
+            trim();
+        } else {
+            /* On failure restore the old retry-on-next-open behavior, including transient disk errors.
+               Waiters re-search the list after waking and never hold this pointer. */
+            free(data);
+            Unpacked **link = &unpacked;
+            while (*link && *link != u) link = &(*link)->next;
+            if (*link) *link = u->next;
+            free(u);
+            fprintf(stderr, "[ps5] romfs: unpacking file %llu failed\n", (unsigned long long)f);
+        }
+        pthread_cond_broadcast(&unpack_changed);
+        return ok ? u : NULL;
     }
-    Unpacked *u = calloc(1, sizeof *u);
-    if (!u) { free(data); return NULL; }
-    u->file = f, u->data = data, u->users = 1, u->last_use = ++use_clock;
-    u->next = unpacked, unpacked = u;
-    unpacked_bytes += r->size;
-    trim();
-    return u;
 }
 
 int64_t nup_romfs_open_file(const char *path) {
